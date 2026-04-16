@@ -1,0 +1,190 @@
+# ============================================================
+#  GitLab CI/CD — React + Node.js + PostgreSQL → Minikube
+#  Stages: test → build → deploy-dev → deploy-staging → deploy-prod
+# ============================================================
+
+stages:
+  - test
+  - build
+  - deploy-dev
+  - deploy-staging
+  - deploy-prod
+
+# ── Shared variables ────────────────────────────────────────
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  FRONTEND_IMAGE: $CI_REGISTRY_IMAGE/frontend
+  BACKEND_IMAGE:  $CI_REGISTRY_IMAGE/backend
+  # Set KUBE_CONFIG_B64 in GitLab → Settings → CI/CD → Variables
+  # (base64-encoded kubeconfig with Minikube credentials)
+
+# ── Reusable anchors ────────────────────────────────────────
+.docker_login: &docker_login
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+
+.kubectl_setup: &kubectl_setup
+  image: bitnami/kubectl:1.29
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "$KUBE_CONFIG_B64" | base64 -d > ~/.kube/config
+    - chmod 600 ~/.kube/config
+    - kubectl cluster-info   # smoke-test the connection
+
+.deploy_script: &deploy_script
+  script:
+    # Create namespace if it doesn't exist
+    - kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+    # Apply postgres (StatefulSet + Service + PVC + Secret)
+    - envsubst < k8s/postgres/postgres.yaml  | kubectl apply -n "$NAMESPACE" -f -
+    - kubectl rollout status statefulset/postgres -n "$NAMESPACE" --timeout=120s
+    # Apply backend
+    - envsubst < k8s/backend/backend.yaml    | kubectl apply -n "$NAMESPACE" -f -
+    - kubectl rollout status deployment/backend -n "$NAMESPACE" --timeout=120s
+    # Apply frontend
+    - envsubst < k8s/frontend/frontend.yaml  | kubectl apply -n "$NAMESPACE" -f -
+    - kubectl rollout status deployment/frontend -n "$NAMESPACE" --timeout=120s
+    # Show running pods
+    - kubectl get pods,svc -n "$NAMESPACE"
+
+# ════════════════════════════════════════════════════════════
+#  STAGE 1 — TEST
+# ════════════════════════════════════════════════════════════
+test:frontend:
+  stage: test
+  image: node:20-alpine
+  cache:
+    key: "frontend-$CI_COMMIT_REF_SLUG"
+    paths: [frontend/node_modules/]
+  script:
+    - cd frontend
+    - npm ci
+    - npm test -- --watchAll=false --passWithNoTests --coverage
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: frontend/coverage/cobertura-coverage.xml
+    expire_in: 7 days
+
+test:backend:
+  stage: test
+  image: node:20-alpine
+  # Spin up a real Postgres for integration tests
+  services:
+    - name: postgres:15-alpine
+      alias: postgres
+  variables:
+    POSTGRES_DB:       testdb
+    POSTGRES_USER:     testuser
+    POSTGRES_PASSWORD: testpassword
+    DATABASE_URL: "postgresql://testuser:testpassword@postgres:5432/testdb"
+    NODE_ENV: test
+  cache:
+    key: "backend-$CI_COMMIT_REF_SLUG"
+    paths: [backend/node_modules/]
+  script:
+    - cd backend
+    - npm ci
+    - npm test
+  artifacts:
+    reports:
+      junit: backend/junit.xml
+    expire_in: 7 days
+
+# ════════════════════════════════════════════════════════════
+#  STAGE 2 — BUILD & PUSH DOCKER IMAGES
+# ════════════════════════════════════════════════════════════
+build:frontend:
+  stage: build
+  image: docker:26
+  services:
+    - docker:26-dind
+  <<: *docker_login
+  script:
+    - |
+      docker build \
+        --cache-from "$FRONTEND_IMAGE:latest" \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        -t "$FRONTEND_IMAGE:$CI_COMMIT_SHORT_SHA" \
+        -t "$FRONTEND_IMAGE:latest" \
+        ./frontend
+    - docker push "$FRONTEND_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - docker push "$FRONTEND_IMAGE:latest"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "main"'
+
+build:backend:
+  stage: build
+  image: docker:26
+  services:
+    - docker:26-dind
+  <<: *docker_login
+  script:
+    - |
+      docker build \
+        --cache-from "$BACKEND_IMAGE:latest" \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        -t "$BACKEND_IMAGE:$CI_COMMIT_SHORT_SHA" \
+        -t "$BACKEND_IMAGE:latest" \
+        ./backend
+    - docker push "$BACKEND_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - docker push "$BACKEND_IMAGE:latest"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "main"'
+
+# ════════════════════════════════════════════════════════════
+#  STAGE 3 — DEPLOY: DEV  (auto on develop branch)
+# ════════════════════════════════════════════════════════════
+deploy:dev:
+  stage: deploy-dev
+  <<: *kubectl_setup
+  environment:
+    name: development
+    url: http://dev.myapp.local
+  variables:
+    NAMESPACE:        dev
+    IMAGE_TAG:        $CI_COMMIT_SHORT_SHA
+    DB_SECRET_NAME:   postgres-secret-dev
+  <<: *deploy_script
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+# ════════════════════════════════════════════════════════════
+#  STAGE 4 — DEPLOY: STAGING  (manual on main)
+# ════════════════════════════════════════════════════════════
+deploy:staging:
+  stage: deploy-staging
+  <<: *kubectl_setup
+  environment:
+    name: staging
+    url: http://staging.myapp.local
+  variables:
+    NAMESPACE:        staging
+    IMAGE_TAG:        $CI_COMMIT_SHORT_SHA
+    DB_SECRET_NAME:   postgres-secret-staging
+  <<: *deploy_script
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+
+# ════════════════════════════════════════════════════════════
+#  STAGE 5 — DEPLOY: PROD  (manual, requires staging first)
+# ════════════════════════════════════════════════════════════
+deploy:prod:
+  stage: deploy-prod
+  <<: *kubectl_setup
+  environment:
+    name: production
+    url: http://myapp.local
+  variables:
+    NAMESPACE:        prod
+    IMAGE_TAG:        $CI_COMMIT_SHORT_SHA
+    DB_SECRET_NAME:   postgres-secret-prod
+  <<: *deploy_script
+  needs: [deploy:staging]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
